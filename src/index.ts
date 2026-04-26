@@ -3,15 +3,12 @@
 // Entry point. Routes /v1/station/<namespace>/<id> to the orchestrator.
 // Other paths return a small service-info JSON.
 
-import { buoyProFetcher } from "./fetchers/buoypro";
-import { getStationResponse } from "./orchestrator";
+import { getStationResponse, NDBC_FETCHER_CHAIN } from "./orchestrator";
 import { SCHEMA_VERSION } from "./schema";
-
-const BUOY_CHAIN = [buoyProFetcher];
 
 const SERVICE_INFO = {
   service: "surf-report-worker",
-  version: "0.0.2",
+  version: "0.0.3",
   schema_version: SCHEMA_VERSION,
   endpoints: ["/v1/station/<namespace>/<id>"],
   supported_namespaces: ["ndbc"],
@@ -46,7 +43,7 @@ export default {
       const response = await getStationResponse({
         namespace,
         stationId,
-        chain: BUOY_CHAIN,
+        chain: NDBC_FETCHER_CHAIN,
       });
       return jsonResponse(response, 200);
     }

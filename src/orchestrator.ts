@@ -3,20 +3,36 @@
 // Walks a chain of upstream fetchers in priority order, returning the first
 // usable result wrapped in the StationResponse envelope.
 //
-// Phase 1 only has the BuoyPro fetcher in the chain. NDBC widget and SurfTruths
-// will be added in subsequent commits.
+// Phase 1 chain: [buoyProFetcher, ndbcWidgetFetcher]
+// SurfTruths is intentionally not included; in practice its data is wave-only
+// and partly redundant with the two above. Could be added later as a third-tier
+// fallback if needed.
 
 import type {
   StationResponse,
   StationMetadata,
   UpstreamFetcher,
+  UpstreamSource,
   Warning,
 } from "./schema";
 import { SCHEMA_VERSION } from "./schema";
+import { buoyProFetcher } from "./fetchers/buoypro";
+import { ndbcWidgetFetcher } from "./fetchers/ndbcWidget";
 
 export interface StationDirectoryEntry {
   metadata: StationMetadata;
 }
+
+/**
+ * Default fetcher chain for NDBC stations.
+ *
+ * Order: BuoyPro first (most complete, JSON time-series with embedded timestamps),
+ *        NDBC widget second (official, decomposed swell + wind-wave components).
+ */
+export const NDBC_FETCHER_CHAIN: UpstreamFetcher[] = [
+  buoyProFetcher,
+  ndbcWidgetFetcher,
+];
 
 /**
  * Phase 1 station directory.
@@ -81,7 +97,7 @@ export async function getStationResponse(args: {
     type: "buoy",
   };
 
-  const fallbackChainTried: string[] = [];
+  const fallbackChainTried: UpstreamSource[] = [];
   const warnings: Warning[] = [];
 
   for (const fetcher of chain) {
@@ -89,28 +105,13 @@ export async function getStationResponse(args: {
     try {
       const result = await fetcher.fetch(stationId);
       if (result) {
-        const response: StationResponse = {
-          schema_version: SCHEMA_VERSION,
-          station: metadata,
-          fetched_at: new Date().toISOString(),
-          upstream: {
-            source: fetcher.source,
-            url: result.url,
-            fetched_at: result.fetched_at,
-            fallback_chain_used: fallbackChainTried as Warning["code"][] as never,
-            // (the cast above is a workaround for the chain field type;
-            //  see note in README. We'll tighten this later.)
-          },
-          observation: result.observation,
-          warnings,
-        };
-
-        // Add warnings based on what we got.
+        // Build warnings BEFORE constructing the response so the returned
+        // object isn't relying on shared-reference mutation.
         if (fallbackChainTried.length > 1) {
           warnings.push({
             code: "fallback_used",
             message: `Primary upstream(s) failed; served from ${fetcher.source}`,
-            detail: { tried: fallbackChainTried },
+            detail: { tried: fallbackChainTried.slice() },
           });
         }
         if (
@@ -129,6 +130,20 @@ export async function getStationResponse(args: {
           });
         }
 
+        const response: StationResponse = {
+          schema_version: SCHEMA_VERSION,
+          station: metadata,
+          fetched_at: new Date().toISOString(),
+          upstream: {
+            source: fetcher.source,
+            url: result.url,
+            fetched_at: result.fetched_at,
+            fallback_chain_used: fallbackChainTried.slice(),
+          },
+          observation: result.observation,
+          warnings,
+        };
+
         return response;
       }
     } catch (err) {
@@ -143,7 +158,7 @@ export async function getStationResponse(args: {
   warnings.push({
     code: "fallback_chain_exhausted",
     message: "No upstream returned usable data",
-    detail: { tried: fallbackChainTried },
+    detail: { tried: fallbackChainTried.slice() },
   });
 
   return {
@@ -151,10 +166,14 @@ export async function getStationResponse(args: {
     station: metadata,
     fetched_at: new Date().toISOString(),
     upstream: {
-      source: "buoypro",
+      // No upstream actually served data. Use the first chain member as a
+      // formal placeholder; consumers should rely on observation === null
+      // and the fallback_chain_exhausted warning, not the upstream block,
+      // when interpreting failure responses.
+      source: chain[0]?.source ?? "buoypro",
       url: "",
       fetched_at: new Date().toISOString(),
-      fallback_chain_used: [],
+      fallback_chain_used: fallbackChainTried.slice(),
     },
     observation: null,
     warnings,

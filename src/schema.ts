@@ -11,9 +11,10 @@
 // When this schema changes, bump in lockstep:
 //   - the schema_version literal here
 //   - the README's documented schema version
+//   - the CHANGELOG.md entry
 //   - any consumers (daughter prompts, Sheets schema) that depend on it
 
-export const SCHEMA_VERSION = "1.0";
+export const SCHEMA_VERSION = "1.1";
 
 // ---- Top-level response shape ----
 
@@ -100,10 +101,26 @@ export type DataQuality =
 // ---- Domain-nested measurements ----
 
 export interface WaveData {
+  // Aggregate fields — significant wave height and overall period/direction
   significant_height_ft?: number;
   dominant_period_s?: number;
   average_period_s?: number;
   mean_wave_direction_deg?: number;
+
+  // Decomposed components — added in schema 1.1 to support fetchers that
+  // expose swell and wind-wave separately (NDBC widget). Each sub-block
+  // is independently optional: a fetcher might supply only swell, only
+  // wind_wave, both, or neither.
+  swell?: WaveComponent;
+  wind_wave?: WaveComponent;
+}
+
+export interface WaveComponent {
+  height_ft?: number;
+  period_s?: number;
+  direction_deg?: number;
+  direction_cardinal?: string;  // e.g. "SSW" — preserved when source gives cardinals
+                                 // (precision is ~22.5° band, not exact heading)
 }
 
 export interface WindData {
