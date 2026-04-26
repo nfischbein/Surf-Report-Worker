@@ -1,0 +1,6 @@
+name = "surf-report-worker"
+main = "src/index.ts"
+compatibility_date = "2026-04-26"
+
+# Workers free tier defaults are fine. No KV, no Durable Objects yet — we'll
+# add caching infrastructure when the parser exists.
