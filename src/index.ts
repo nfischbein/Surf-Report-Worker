@@ -1,33 +1,75 @@
-// Surf-Report-Worker — hello world
-// Phase 1 step 1: prove the deploy pipe works.
-// This Worker ignores the request path and returns a static JSON payload.
-// Real routing arrives once the schema is locked.
+// src/index.ts
+//
+// Entry point. Routes /v1/station/<namespace>/<id> to the orchestrator.
+// Other paths return a small service-info JSON.
+
+import { buoyProFetcher } from "./fetchers/buoypro";
+import { getStationResponse } from "./orchestrator";
+import { SCHEMA_VERSION } from "./schema";
+
+const BUOY_CHAIN = [buoyProFetcher];
+
+const SERVICE_INFO = {
+  service: "surf-report-worker",
+  version: "0.0.2",
+  schema_version: SCHEMA_VERSION,
+  endpoints: ["/v1/station/<namespace>/<id>"],
+  supported_namespaces: ["ndbc"],
+  notes: "Phase 1 — buoy support only. Tide and METAR support pending.",
+};
 
 export default {
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
+    const path = url.pathname.replace(/\/+$/, ""); // strip trailing slash
 
-    const body = {
-      service: "surf-report-worker",
-      version: "0.0.1",
-      status: "ok",
-      message: "Hello from the Worker. Routing not yet implemented.",
-      received: {
-        method: request.method,
-        path: url.pathname,
-        timestamp: new Date().toISOString(),
-      },
-    };
+    // /v1/station/<namespace>/<id>
+    const stationMatch = path.match(
+      /^\/v1\/station\/([a-z]+)\/([A-Za-z0-9_-]+)$/
+    );
+    if (stationMatch) {
+      const [, namespace, stationId] = stationMatch;
 
-    return new Response(JSON.stringify(body, null, 2), {
-      status: 200,
-      headers: {
-        "content-type": "application/json; charset=utf-8",
-        // Permissive CORS for now. We'll lock this down when daughter prompts
-        // start calling the Worker — but during dev, browser-based curl-equivalents
-        // and quick checks shouldn't be blocked.
-        "access-control-allow-origin": "*",
-      },
-    });
+      // Phase 1: only ndbc namespace is supported.
+      if (namespace !== "ndbc") {
+        return jsonResponse(
+          {
+            error: "unsupported_namespace",
+            namespace,
+            supported: ["ndbc"],
+            note: "Phase 1 supports NDBC buoys only.",
+          },
+          400
+        );
+      }
+
+      const response = await getStationResponse({
+        namespace,
+        stationId,
+        chain: BUOY_CHAIN,
+      });
+      return jsonResponse(response, 200);
+    }
+
+    // Service info on root.
+    if (path === "" || path === "/") {
+      return jsonResponse(SERVICE_INFO, 200);
+    }
+
+    return jsonResponse(
+      { error: "not_found", path: url.pathname },
+      404
+    );
   },
 };
+
+function jsonResponse(body: unknown, status: number): Response {
+  return new Response(JSON.stringify(body, null, 2), {
+    status,
+    headers: {
+      "content-type": "application/json; charset=utf-8",
+      "access-control-allow-origin": "*",
+      "cache-control": "no-store",
+    },
+  });
+}
