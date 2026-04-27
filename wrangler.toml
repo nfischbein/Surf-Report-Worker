@@ -2,5 +2,20 @@ name = "surf-report-worker"
 main = "src/index.ts"
 compatibility_date = "2026-04-26"
 
-# Workers free tier defaults are fine. No KV, no Durable Objects yet — we'll
-# add caching infrastructure when the parser exists.
+# KV namespace for reactive caching.
+#
+# Before first deploy: provision the namespace with
+#   wrangler kv:namespace create SURF_CACHE
+# Wrangler will print an `id`. Paste it below replacing PASTE_KV_ID_HERE.
+#
+# For local dev with `wrangler dev`, also create a preview namespace:
+#   wrangler kv:namespace create SURF_CACHE --preview
+# and paste that id into preview_id below.
+#
+# The Worker degrades gracefully if SURF_CACHE is unbound — every request
+# goes to upstream, no caching. So local dev without preview_id still works.
+
+[[kv_namespaces]]
+binding = "SURF_CACHE"
+id = "4f48599ead524546892f183c60f9671e"
+preview_id = "603972db433840a5b7b6b8a76811c248"
