@@ -250,11 +250,18 @@ function resolveMetadata(
 // =============================================================================
 
 // TTL strategy:
-//   NDBC observation (any upstream)     : 5 min  — buoys post every 30-60 min,
-//                                                  freshness recomputed on hit
-//                                                  from the original observed_at
-//                                                  so cache age never inflates
-//                                                  the freshness band.
+//   NDBC observation (any upstream)     : 5 min  — buoys post every 30-60 min.
+//                                                  On cache hit, the orchestrator
+//                                                  re-stamps top-level `fetched_at`
+//                                                  to now and recomputes
+//                                                  observation.age_seconds and
+//                                                  observation.freshness against
+//                                                  current time using
+//                                                  observation.observed_at as the
+//                                                  anchor. Cache age never inflates
+//                                                  the freshness band, and the
+//                                                  served response always reflects
+//                                                  when it left the Worker.
 //   CO-OPS tide observations            : 5 min  — bounded by water_level cadence
 //                                                  (sensor reports every 6 min).
 //                                                  Predictions are bundled into
@@ -272,14 +279,27 @@ function resolveMetadata(
 //                                                  comfortably inside the "current"
 //                                                  validity_freshness band (<6h).
 //
-// Cache key shape: v1:station:<namespace>:<id>[:<window>] for stations,
-//                  v1:forecast:wind:<rlat>:<rlon>:<rtime> for forecast-wind.
-// The v1 prefix lets us flush all entries cleanly on a future schema-breaking
-// change. Window suffix is only used for tide stations where days_requested
-// affects response shape. Forecast-wind cache key rounds lat/lon to 3 decimals
-// (~110m) and time to the nearest hour to avoid sub-meaningful fragmentation.
+// On-serve recompute is currently NDBC-only. CO-OPS / METAR / forecast-wind
+// have channel-specific freshness models (per-channel for CO-OPS, separate
+// validity_freshness for forecast-wind) that don't map cleanly onto a single
+// observed_at→now recompute. Their TTLs are short enough that within-window
+// staleness on cache hit is bounded acceptably without recompute. If a future
+// change wants on-serve recompute for those data classes, the per-namespace
+// transform passed into cachedBuild is the extension point.
+//
+// Cache key shape: v2:station:<namespace>:<id>[:<window>] for stations,
+//                  v2:forecast:wind:<rlat>:<rlon>:<rtime> for forecast-wind.
+// The v-prefix lets us flush all entries cleanly on a schema-breaking change.
+// Window suffix is only used for tide stations where days_requested affects
+// response shape. Forecast-wind cache key rounds lat/lon to 3 decimals (~110m)
+// and time to the nearest hour to avoid sub-meaningful fragmentation.
+//
+// Bumped v1→v2 to invalidate any leftover entries from earlier code revisions
+// that may have been written without TTL or with longer-than-intended TTL.
+// Any orphaned v1:* entries will sit unread until their (possibly long) TTLs
+// expire; they are never read again.
 
-const CACHE_KEY_PREFIX = "v1";
+const CACHE_KEY_PREFIX = "v2";
 const CACHE_TTL_SECONDS = {
   ndbc: 5 * 60,
   coops: 5 * 60,
@@ -322,9 +342,88 @@ function cacheKeyForForecastWind(
 }
 
 /**
+ * NDBC freshness thresholds. Lifted verbatim from the buoyProFetcher's
+ * freshnessFromAge to ensure on-serve recompute produces the same labels a
+ * fresh fetch would produce. If buoyProFetcher's thresholds change, change
+ * these in lockstep — they intentionally match.
+ */
+const NDBC_FRESHNESS_THRESHOLDS = {
+  current_max_hours: 3,
+  stale_max_hours: 6,
+  gap_max_hours: 24,
+} as const;
+
+function ndbcFreshnessFromAge(
+  ageSeconds: number
+): Observation["freshness"] {
+  const hours = ageSeconds / 3600;
+  if (hours < NDBC_FRESHNESS_THRESHOLDS.current_max_hours) return "current";
+  if (hours < NDBC_FRESHNESS_THRESHOLDS.stale_max_hours) return "stale";
+  if (hours < NDBC_FRESHNESS_THRESHOLDS.gap_max_hours) return "gap";
+  return "offline";
+}
+
+/**
+ * Re-stamps a cached BuoyStationResponse for serve.
+ *   - Top-level `fetched_at` is set to current time so callers see when the
+ *     response left the Worker (not when the cache entry was built).
+ *   - `observation.age_seconds` is recomputed as (now - observed_at).
+ *   - `observation.freshness` is reclassified from the new age.
+ *   - `upstream.fetched_at` and `observation.observed_at` are intentionally
+ *     unchanged — those are properties of the underlying data and shouldn't
+ *     drift just because the response was served from cache.
+ *
+ * If the cached response is a "no observation" envelope (chain exhausted at
+ * build time), the freshness recompute is skipped and only `fetched_at` is
+ * re-stamped.
+ *
+ * Defends against the bug class where a cache entry written by an earlier
+ * code revision (or with an unintended long TTL) is served verbatim and
+ * appears confidently-current to callers despite being hours or days old.
+ */
+function restampBuoyResponseOnServe(
+  cached: BuoyStationResponse
+): BuoyStationResponse {
+  const nowIso = new Date().toISOString();
+
+  if (cached.observation === null) {
+    return { ...cached, fetched_at: nowIso };
+  }
+
+  const observedMs = Date.parse(cached.observation.observed_at);
+  if (Number.isNaN(observedMs)) {
+    // Defensive: if observed_at is unparseable, leave the observation block
+    // alone but still re-stamp the envelope. The fresh-fetch path would not
+    // have produced an unparseable observed_at, so this is a "shouldn't
+    // happen" branch — we don't try to repair it here.
+    return { ...cached, fetched_at: nowIso };
+  }
+
+  const ageSeconds = Math.max(
+    0,
+    Math.round((Date.parse(nowIso) - observedMs) / 1000)
+  );
+  const freshness = ndbcFreshnessFromAge(ageSeconds);
+
+  return {
+    ...cached,
+    fetched_at: nowIso,
+    observation: {
+      ...cached.observation,
+      age_seconds: ageSeconds,
+      freshness,
+    },
+  };
+}
+
+
+/**
  * Fetch a value through the KV cache, building it via `builder` on miss.
  *
- * On cache hit: returns the cached value as-is (no re-running of the chain).
+ * On cache hit: returns the cached value, optionally passed through
+ *   `transformOnHit` to re-stamp serve-time fields (e.g. top-level fetched_at,
+ *   recomputed freshness). If `transformOnHit` is omitted, the cached value
+ *   is returned as-is.
  * On cache miss: runs the builder, caches the result, returns it.
  * If env.SURF_CACHE is undefined (no binding): falls through to the builder
  * every call, no caching. This makes local dev and test environments work
@@ -339,7 +438,8 @@ async function cachedBuild<T>(
   cacheKey: string,
   ttlSeconds: number,
   builder: () => Promise<T>,
-  shouldCache: (result: T) => boolean
+  shouldCache: (result: T) => boolean,
+  transformOnHit?: (cached: T) => T
 ): Promise<T> {
   if (!env.SURF_CACHE) {
     return builder();
@@ -347,7 +447,9 @@ async function cachedBuild<T>(
 
   try {
     const cached = (await env.SURF_CACHE.get(cacheKey, "json")) as T | null;
-    if (cached) return cached;
+    if (cached) {
+      return transformOnHit ? transformOnHit(cached) : cached;
+    }
   } catch {
     // Cache read errors are non-fatal — fall through to builder.
   }
@@ -391,7 +493,8 @@ export async function getBuoyStationResponse(
     () => buildBuoyStationResponse(namespace, stationId, chain),
     (resp) =>
       resp.observation !== null &&
-      !resp.warnings.some((w) => w.code === "fallback_chain_exhausted")
+      !resp.warnings.some((w) => w.code === "fallback_chain_exhausted"),
+    restampBuoyResponseOnServe
   );
 }
 
