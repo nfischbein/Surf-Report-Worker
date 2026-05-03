@@ -19,3 +19,17 @@ compatibility_date = "2026-04-26"
 binding = "SURF_CACHE"
 id = "4f48599ead524546892f183c60f9671e"
 preview_id = "603972db433840a5b7b6b8a76811c248"
+
+# Diagnostic relay (/v1/report).
+#
+# Two secrets drive the relay; both are set with `wrangler secret put`,
+# never written to this file:
+#
+#   wrangler secret put MONITORING_RELAY_URL
+#     # paste the Apps Script Web App URL when prompted
+#   wrangler secret put MONITORING_SECRET
+#     # paste the same secret stored in the Apps Script's MONITORING_SECRET
+#     # script property
+#
+# When either secret is unset, /v1/report returns ok:false with a
+# relay_error message; the rest of the Worker is unaffected.

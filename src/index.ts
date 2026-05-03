@@ -19,21 +19,32 @@ import {
   FORECAST_WIND_FETCHER_CHAIN,
   type Env,
 } from "./orchestrator";
-import { SCHEMA_VERSION, type IdNamespace } from "./schema";
+import {
+  SCHEMA_VERSION,
+  type IdNamespace,
+  type DiagnosticPayload,
+  type DiagnosticResponse,
+  DIAGNOSTIC_RUNTIMES,
+  DIAGNOSTIC_REPORT_TYPES,
+  DIAGNOSTIC_CONFIDENCE_VALUES,
+  DIAGNOSTIC_FETCH_PATHS,
+  DIAGNOSTIC_LIMITS,
+} from "./schema";
 
 const SERVICE_INFO = {
   service: "surf-report-worker",
-  version: "0.0.6",
+  version: "0.0.7",
   schema_version: SCHEMA_VERSION,
   endpoints: [
     "/v1/station/ndbc/<id>",
     "/v1/station/coops/<id>?days=<1-7>",
     "/v1/station/icao/<id>",
     "/v1/forecast/wind?lat=<lat>&lon=<lon>&time=<ISO>[&units=kt|mph][&lookback=<hours>]",
+    "/v1/report (POST, diagnostic relay; see schema.ts DiagnosticPayload)",
   ],
   supported_namespaces: ["ndbc", "coops", "icao"],
   notes:
-    "Phase 3 — buoy + tide + METAR + forecast-wind support. International namespaces (ukmo, bom) reserved.",
+    "Phase 3 — buoy + tide + METAR + forecast-wind support. International namespaces (ukmo, bom) reserved. /v1/report relays anonymous diagnostic payloads to a central monitoring sheet.",
 };
 
 const SUPPORTED_NAMESPACES: IdNamespace[] = ["ndbc", "coops", "icao"];
@@ -142,6 +153,22 @@ export default {
         chain: FORECAST_WIND_FETCHER_CHAIN,
         env,
       });
+      return jsonResponse(response, 200);
+    }
+
+    // /v1/report — diagnostic relay
+    if (path === "/v1/report") {
+      if (request.method !== "POST") {
+        return jsonResponse(
+          { error: "method_not_allowed", detail: "POST required" },
+          405
+        );
+      }
+      const response = await handleDiagnosticReport(request, env);
+      // Always 200; the body's `ok` field tells the caller what happened.
+      // This matches the Apps Script's behavior and avoids cases where a
+      // daughter prompt's HTTP-error handling masks a clean validation
+      // rejection that the LLM should be able to inspect.
       return jsonResponse(response, 200);
     }
 
@@ -283,4 +310,215 @@ function jsonResponse(body: unknown, status: number): Response {
       "cache-control": "no-store",
     },
   });
+}
+
+// =============================================================================
+// Diagnostic relay (/v1/report)
+// =============================================================================
+//
+// Daughter prompts POST a DiagnosticPayload here after rendering a report.
+// The Worker validates and normalizes the payload, then relays to the central
+// Apps Script using MONITORING_RELAY_URL + MONITORING_SECRET held as Wrangler
+// secrets. The endpoint is open inbound (no caller secret) — same risk profile
+// as the rest of the Worker. Daily volume is bounded by the Apps Script cap;
+// duplicates are deduped by run_id at the Apps Script.
+//
+// Privacy: the Worker does not pass through cf-connecting-ip, User-Agent, or
+// any other request-derived identifier to the relay. Only the validated
+// payload fields are forwarded.
+
+async function handleDiagnosticReport(
+  request: Request,
+  env: Env
+): Promise<DiagnosticResponse> {
+  if (!env.MONITORING_RELAY_URL || !env.MONITORING_SECRET) {
+    return {
+      ok: false,
+      received_at: null,
+      relay_status: "relay_error",
+      error: "diagnostic relay is not configured on this Worker deployment",
+    };
+  }
+
+  let raw: unknown;
+  try {
+    raw = await request.json();
+  } catch (err) {
+    return {
+      ok: false,
+      received_at: null,
+      relay_status: "validation_error",
+      error: "invalid JSON body",
+    };
+  }
+
+  const validation = validateDiagnosticPayload(raw);
+  if (validation.error) {
+    return {
+      ok: false,
+      received_at: null,
+      relay_status: "validation_error",
+      error: validation.error,
+    };
+  }
+
+  const relayBody = JSON.stringify({
+    monitoring_secret: env.MONITORING_SECRET,
+    data: validation.payload,
+  });
+
+  let relayResponseText: string;
+  try {
+    const relayResponse = await fetch(env.MONITORING_RELAY_URL, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: relayBody,
+      // Cloudflare's fetch follows redirects by default, which handles the
+      // Apps Script 302 from script.google.com to script.googleusercontent.com
+      // automatically. The body is read on the original POST before redirect,
+      // so the redirect-as-GET is safe.
+    });
+    relayResponseText = await relayResponse.text();
+  } catch (err) {
+    return {
+      ok: false,
+      received_at: null,
+      relay_status: "relay_error",
+      error: `relay fetch failed: ${err instanceof Error ? err.message : String(err)}`,
+    };
+  }
+
+  let relayJson: {
+    ok?: boolean;
+    received_at?: string;
+    duplicate?: boolean;
+    error?: string;
+  };
+  try {
+    relayJson = JSON.parse(relayResponseText);
+  } catch (err) {
+    return {
+      ok: false,
+      received_at: null,
+      relay_status: "relay_error",
+      error: "relay returned non-JSON response",
+    };
+  }
+
+  if (relayJson.ok === false) {
+    return {
+      ok: false,
+      received_at: null,
+      relay_status: "relay_error",
+      error: relayJson.error ?? "relay rejected the payload",
+    };
+  }
+
+  if (relayJson.duplicate) {
+    return {
+      ok: true,
+      received_at: null,
+      relay_status: "duplicate",
+    };
+  }
+
+  return {
+    ok: true,
+    received_at: relayJson.received_at ?? null,
+    relay_status: "ok",
+  };
+}
+
+interface DiagnosticValidationResult {
+  payload: DiagnosticPayload;
+  error: string | null;
+}
+
+function validateDiagnosticPayload(raw: unknown): DiagnosticValidationResult {
+  const fail = (msg: string): DiagnosticValidationResult => ({
+    payload: {} as DiagnosticPayload,
+    error: msg,
+  });
+
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return fail("body must be a JSON object");
+  }
+  const obj = raw as Record<string, unknown>;
+
+  // run_id — required, length-capped, no enum.
+  const runIdRaw = readString(obj.run_id);
+  if (!runIdRaw) return fail("run_id is required");
+  const run_id = runIdRaw.slice(0, DIAGNOSTIC_LIMITS.RUN_ID_MAX);
+
+  // report_type — strict enum.
+  const reportTypeRaw = readString(obj.report_type);
+  if (!reportTypeRaw) return fail("report_type is required");
+  if (!(DIAGNOSTIC_REPORT_TYPES as readonly string[]).includes(reportTypeRaw)) {
+    return fail(
+      `invalid report_type: ${JSON.stringify(reportTypeRaw)}; must be one of ${DIAGNOSTIC_REPORT_TYPES.join(", ")}`
+    );
+  }
+  const report_type = reportTypeRaw as typeof DIAGNOSTIC_REPORT_TYPES[number];
+
+  // confidence — strict enum.
+  const confidenceRaw = readString(obj.confidence);
+  if (!confidenceRaw) return fail("confidence is required");
+  if (!(DIAGNOSTIC_CONFIDENCE_VALUES as readonly string[]).includes(confidenceRaw)) {
+    return fail(
+      `invalid confidence: ${JSON.stringify(confidenceRaw)}; must be one of ${DIAGNOSTIC_CONFIDENCE_VALUES.join(", ")}`
+    );
+  }
+  const confidence = confidenceRaw as typeof DIAGNOSTIC_CONFIDENCE_VALUES[number];
+
+  // runtime — lenient enum, falls back to "other".
+  const runtimeRaw = readString(obj.runtime) ?? "";
+  const runtime = (DIAGNOSTIC_RUNTIMES as readonly string[]).includes(runtimeRaw)
+    ? (runtimeRaw as typeof DIAGNOSTIC_RUNTIMES[number])
+    : "other";
+
+  // fetch_path — lenient enum, falls back to "unknown".
+  const fetchPathRaw = readString(obj.fetch_path) ?? "";
+  const fetch_path = (DIAGNOSTIC_FETCH_PATHS as readonly string[]).includes(fetchPathRaw)
+    ? (fetchPathRaw as typeof DIAGNOSTIC_FETCH_PATHS[number])
+    : "unknown";
+
+  // kit_version — required, length-capped.
+  const kitVersionRaw = readString(obj.kit_version);
+  if (!kitVersionRaw) return fail("kit_version is required");
+  const kit_version = kitVersionRaw.slice(0, DIAGNOSTIC_LIMITS.KIT_VERSION_MAX);
+
+  // break_name — required, length-capped.
+  const breakNameRaw = readString(obj.break_name);
+  if (!breakNameRaw) return fail("break_name is required");
+  const break_name = breakNameRaw.slice(0, DIAGNOSTIC_LIMITS.BREAK_NAME_MAX);
+
+  // data_gaps — optional, length-capped, may be empty string.
+  const data_gaps = (readString(obj.data_gaps) ?? "").slice(0, DIAGNOSTIC_LIMITS.DATA_GAPS_MAX);
+
+  // deviation_notes — optional, length-capped, may be empty string.
+  const deviation_notes = (readString(obj.deviation_notes) ?? "").slice(
+    0,
+    DIAGNOSTIC_LIMITS.DEVIATION_NOTES_MAX
+  );
+
+  return {
+    payload: {
+      run_id,
+      kit_version,
+      runtime,
+      report_type,
+      break_name,
+      confidence,
+      fetch_path,
+      data_gaps,
+      deviation_notes,
+    },
+    error: null,
+  };
+}
+
+function readString(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
 }

@@ -446,3 +446,88 @@ export interface UpstreamFetcher<T = Observation> {
     fetched_at: string;
   } | null>;
 }
+
+// =============================================================================
+// Diagnostic relay (POST /v1/report)
+// =============================================================================
+//
+// Daughter prompts POST to /v1/report after rendering a report. The Worker
+// validates the payload and relays it to a central Google Apps Script that
+// appends rows to a monitoring sheet. The relay is intended only for
+// observability — it must never block, alter, or surface inside the report
+// the user reads.
+//
+// Privacy contract (referenced in the homepage FAQ):
+//   - No personal identity (name, email, account, IP) is captured here.
+//   - Break name and runtime identity ARE captured; both are public-facing.
+//   - The Worker does not pass through cf-connecting-ip or User-Agent to
+//     the relay sheet. Cloudflare's own request logs are out of scope.
+//
+// This endpoint is open inbound (no caller secret). The outbound relay
+// to Apps Script is authenticated by MONITORING_SECRET held as a Worker
+// secret env var; daughter prompts never see it.
+
+export const DIAGNOSTIC_RUNTIMES = [
+  "claude_web",
+  "claude_api",
+  "chatgpt_plus",
+  "chatgpt_free",
+  "perplexity_pro",
+  "perplexity_free",
+  "other",
+] as const;
+
+export const DIAGNOSTIC_REPORT_TYPES = ["session", "long_range"] as const;
+
+export const DIAGNOSTIC_CONFIDENCE_VALUES = [
+  "High",
+  "Medium",
+  "Low",
+  "Speculative",
+] as const;
+
+export const DIAGNOSTIC_FETCH_PATHS = [
+  "default",
+  "code_exec_http",
+  "search_only",
+  "mixed",
+  "unknown",
+] as const;
+
+export type DiagnosticRuntime = typeof DIAGNOSTIC_RUNTIMES[number];
+export type DiagnosticReportType = typeof DIAGNOSTIC_REPORT_TYPES[number];
+export type DiagnosticConfidence = typeof DIAGNOSTIC_CONFIDENCE_VALUES[number];
+export type DiagnosticFetchPath = typeof DIAGNOSTIC_FETCH_PATHS[number];
+
+// Field length caps. These mirror the Apps Script's caps so that anything
+// the Worker accepts will also be accepted by the relay. The Worker truncates
+// (not rejects) over-length values, matching relay behavior.
+export const DIAGNOSTIC_LIMITS = {
+  RUN_ID_MAX: 64,
+  KIT_VERSION_MAX: 16,
+  BREAK_NAME_MAX: 200,
+  DATA_GAPS_MAX: 500,
+  DEVIATION_NOTES_MAX: 500,
+} as const;
+
+// What daughter prompts POST to /v1/report. All fields required except
+// data_gaps and deviation_notes which may be empty strings.
+export interface DiagnosticPayload {
+  run_id: string;
+  kit_version: string;
+  runtime: DiagnosticRuntime;
+  report_type: DiagnosticReportType;
+  break_name: string;
+  confidence: DiagnosticConfidence;
+  fetch_path: DiagnosticFetchPath;
+  data_gaps: string;        // comma-separated state vocab values, or ""
+  deviation_notes: string;  // free text, or ""
+}
+
+// What the Worker returns to the caller after relaying.
+export interface DiagnosticResponse {
+  ok: boolean;
+  received_at: string | null;   // server timestamp from relay; null on failure
+  relay_status: "ok" | "duplicate" | "relay_error" | "validation_error";
+  error?: string;               // populated when ok === false
+}

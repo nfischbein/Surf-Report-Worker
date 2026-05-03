@@ -52,8 +52,15 @@ import { openMeteoFetcher } from "./fetchers/openMeteo";
 // SURF_CACHE is a KV namespace bound in wrangler.toml. May be undefined in
 // local dev or test environments without the binding — the cache helper
 // degrades gracefully (every call goes to upstream, no caching).
+//
+// MONITORING_RELAY_URL and MONITORING_SECRET drive the /v1/report endpoint.
+// Both are Wrangler secrets, not committed. When either is unset, /v1/report
+// returns ok:false with a relay_error explaining the deployment is not
+// configured for diagnostics; the rest of the Worker is unaffected.
 export interface Env {
   SURF_CACHE?: KVNamespace;
+  MONITORING_RELAY_URL?: string;
+  MONITORING_SECRET?: string;
 }
 
 // Minimal KVNamespace surface we use. Avoids needing the full
