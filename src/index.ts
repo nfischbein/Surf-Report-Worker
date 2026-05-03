@@ -23,7 +23,7 @@ import { SCHEMA_VERSION, type IdNamespace } from "./schema";
 
 const SERVICE_INFO = {
   service: "surf-report-worker",
-  version: "0.0.5",
+  version: "0.0.6",
   schema_version: SCHEMA_VERSION,
   endpoints: [
     "/v1/station/ndbc/<id>",

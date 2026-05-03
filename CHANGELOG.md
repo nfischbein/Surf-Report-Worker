@@ -9,6 +9,90 @@ Worker package version (`package.json`) and schema version (`SCHEMA_VERSION` in
 `src/schema.ts`) move independently — the schema version follows the Builder
 Prompt's contract, and the package version tracks deploy state.
 
+## [worker 0.0.6] — 2026-05-03 — NDBC realtime2 fetcher promoted to chain primary
+
+Adds a new NDBC fetcher that reads NOAA's canonical published realtime2
+feeds (`.txt` standard meteorological + `.spec` spectral wave decomposition)
+and promotes it to NDBC chain primary. Demotes BuoyPro to tertiary; NDBC
+widget stays at secondary. No schema shape change — the decomposition
+fields under `WaveData` (added in schema 1.1) are now populated for SoCal
+nearshore stations from realtime2's `.spec` feed; previously those fields
+stayed empty for these stations because BuoyPro doesn't expose
+decomposition for them.
+
+Coordinated Builder edits to HARD RULE 2 in `system_builder_prompt.txt`
+are deliberately deferred — they happen in a separate Builder thread after
+3–7 days of empirical validation that the realtime2 `.spec` decomposition
+produces noticeably better Tier 1 prose.
+
+### Added
+
+- **`src/fetchers/ndbcRealtime2.ts`** — new fetcher implementing the
+  `UpstreamFetcher` interface. Fetches `.txt` and `.spec` in parallel
+  via `Promise.all`. Parses fixed-column whitespace-tokenized data,
+  skipping `#`-prefixed header rows and treating `MM` as the missing-data
+  sentinel.
+- **Per-field freshness model.** Within each feed, walks rows from
+  newest to oldest and records the most-recent non-`MM` value per field
+  alongside its row timestamp. `observed_at` on the composed Observation
+  is the max timestamp across all contributing rows. This is necessary
+  because NDBC reports DPD/APD/MWD on a slower cadence than WVHT — naively
+  picking the latest row would miss period/direction values that are
+  available one or two rows back. Mirrors how the BuoyPro fetcher handles
+  its per-field JSON time series.
+- **16-point compass → degrees lookup.** `.spec` reports SwD and WWD as
+  compass cardinals (e.g. "SW", "WNW") despite the header line claiming
+  WWD is degT. The lookup table is duplicated locally rather than
+  imported from `ndbcWidget.ts`; if a third fetcher ever needs the same
+  conversion, refactoring to a shared utility becomes worth doing.
+- **`UpstreamSource` literal `"ndbc_realtime2"`** added to the schema's
+  union. Strictly additive — no consumer code branches on the prior set
+  of literals exhaustively. Schema version not bumped, same precedent as
+  the Phase 3 UpstreamSource additions (METAR + forecast-wind).
+
+### Changed
+
+- **`NDBC_FETCHER_CHAIN` order in `src/orchestrator.ts`:**
+  realtime2 → ndbc_widget → buoypro. Previously buoypro → ndbc_widget.
+  No surftruths entry — the previously-documented "supplementary" tier
+  was never actually wired into the orchestrator.
+- **`SERVICE_INFO.version` in `src/index.ts`:** 0.0.5 → 0.0.6.
+- **NDBC freshness threshold comment in `src/orchestrator.ts`:** generalized
+  from "lifted from buoyProFetcher" to "all NDBC fetchers carry their own
+  copy" since realtime2 now also carries the same thresholds locally.
+- **Schema history comment in `src/schema.ts`:** new history line documenting
+  the realtime2 addition.
+
+### Notes
+
+- **Decomposition character.** For SoCal nearshore stations like 46221 /
+  46222, schema 1.1's `swell` and `wind_wave` sub-blocks under `WaveData`
+  were previously left empty. They now populate with realtime2 `.spec`
+  data: per-component height (m → ft), period (sec), and direction (compass
+  cardinal preserved alongside degree conversion to signal the ~22.5°
+  precision band).
+- **STEEPNESS field.** `.spec` exposes a categorical steepness classification
+  (STEEP / VERY_STEEP / AVERAGE / SWELL) that the parser currently discards.
+  Adding it would require a schema field; deferred as a possible future
+  enhancement.
+- **Wind / atmosphere / water.** For stations with the relevant sensors,
+  realtime2 also populates `wind`, `atmosphere`, and `water` sub-blocks.
+  For stations without (most SoCal nearshore wave buoys), those columns
+  are `MM` in `.txt` and the corresponding sub-blocks stay absent — matching
+  the existing BuoyPro / widget behavior for the same stations.
+- **Lockstep dependency on Builder Prompt.** HARD RULE 2 in
+  `system_builder_prompt.txt` (separate Builder repo) currently states
+  that decomposition is unavailable from BuoyPro for SoCal nearshore
+  stations and frames BuoyPro as the verified primary. Both framings are
+  obsolete after this ship but remain operationally harmless during the
+  3–7 day empirical validation window — the rule's source-selection
+  guidance still works because the Worker handles chain selection.
+  Builder edits land in a separate Builder thread after validation.
+- **Pre-existing version drift.** `package.json` reports `"version":
+  "0.0.1"` while `SERVICE_INFO` (and thus the version exposed at the
+  Worker root) is now `"0.0.6"`. This drift predates Item 25; not fixed
+  here to keep the change focused on the realtime2 work.
+
 ## [worker 0.0.5] — 2026-04-27 — schema 1.2 Phase 3 (METAR + forecast-wind)
 
 Phase 3 ships the implementation of two endpoint families that have been part

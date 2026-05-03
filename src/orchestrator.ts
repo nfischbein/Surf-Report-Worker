@@ -30,6 +30,7 @@ import type {
   IdNamespace,
 } from "./schema";
 import { SCHEMA_VERSION } from "./schema";
+import { ndbcRealtime2Fetcher } from "./fetchers/ndbcRealtime2";
 import { buoyProFetcher } from "./fetchers/buoypro";
 import { ndbcWidgetFetcher } from "./fetchers/ndbcWidget";
 import { coopsApiFetcher } from "./fetchers/coopsApi";
@@ -72,12 +73,27 @@ interface KVNamespace {
 
 /**
  * NDBC fetcher chain.
- * Order: BuoyPro first (most complete, JSON time-series with embedded timestamps),
- *        NDBC widget second (official, decomposed swell + wind-wave components).
+ * Order:
+ *   1. realtime2  — NOAA's canonical published feed (.txt + .spec). Most
+ *                   complete tier-1 source: standard met + wind/atm/water
+ *                   when station has those sensors, plus decomposed swell
+ *                   vs. wind-wave components from .spec.
+ *   2. ndbc_widget — official NOAA fallback. Decomposed swell/wind-wave
+ *                   for SoCal nearshore stations; no wind/atm.
+ *   3. buoypro    — third-party aggregator. Aggregate fields only (no
+ *                   decomposition for SoCal nearshore stations); kept as
+ *                   tertiary defense in depth in case both NDBC paths
+ *                   degrade simultaneously.
+ *
+ * Demoted from primary in May 2026: previously buoypro was first because
+ * realtime2 wasn't yet wired in. realtime2's .spec exposes decomposition
+ * that BuoyPro doesn't, and citing NOAA's canonical published feed is
+ * stronger provenance than a third-party mirror.
  */
 export const NDBC_FETCHER_CHAIN: UpstreamFetcher[] = [
-  buoyProFetcher,
+  ndbcRealtime2Fetcher,
   ndbcWidgetFetcher,
+  buoyProFetcher,
 ];
 
 /**
@@ -342,10 +358,12 @@ function cacheKeyForForecastWind(
 }
 
 /**
- * NDBC freshness thresholds. Lifted verbatim from the buoyProFetcher's
- * freshnessFromAge to ensure on-serve recompute produces the same labels a
- * fresh fetch would produce. If buoyProFetcher's thresholds change, change
- * these in lockstep — they intentionally match.
+ * NDBC freshness thresholds. All NDBC fetchers (ndbcRealtime2Fetcher,
+ * ndbcWidgetFetcher, buoyProFetcher) carry their own copy of these
+ * thresholds. The on-serve recompute below uses these to ensure cached
+ * responses get reclassified consistently with what a fresh fetch would
+ * produce. If any fetcher's thresholds change, change all four call
+ * sites in lockstep — they intentionally match.
  */
 const NDBC_FRESHNESS_THRESHOLDS = {
   current_max_hours: 3,

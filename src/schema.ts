@@ -29,6 +29,14 @@
 //         and forecast-specific failure modes. Schema version not bumped because
 //         these types were specified in the v1.2 contract from the start;
 //         Phase 3 ships the implementation that makes the contract real.
+//   1.2 — NDBC realtime2 fetcher (May 2026): adds "ndbc_realtime2" to the
+//         UpstreamSource union and promotes it to NDBC chain primary.
+//         Strictly additive — no field shape changes. The decomposition
+//         fields under WaveData (added in 1.1) are now populated for SoCal
+//         nearshore stations from realtime2's .spec feed; previously those
+//         fields stayed empty for these stations because BuoyPro doesn't
+//         expose decomposition for them. Schema version not bumped — same
+//         precedent as the Phase 3 UpstreamSource additions.
 
 export const SCHEMA_VERSION = "1.2";
 
@@ -159,6 +167,7 @@ export interface UpstreamMetadata {
 
 export type UpstreamSource =
   // Buoy
+  | "ndbc_realtime2"
   | "buoypro"
   | "ndbc_widget"
   | "surftruths"
